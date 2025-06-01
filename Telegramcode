@@ -1,0 +1,286 @@
+#!/usr/bin/env python
+# pylint: disable=unused-argument, wrong-import-position
+# This program is dedicated to the public domain under the CC0 license.
+
+"""
+A simple Telegram Bot to manage a queue of music links.
+Users can add links, and the bot will "play" them by announcing them in the chat.
+"""
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from collections import deque
+import re # For URL validation
+import os # For getting token from environment variable
+
+# --- Configuration ---
+# It's recommended to set your bot token as an environment variable for security.
+# You can name it TELEGRAM_BOT_TOKEN.
+# If not found, it will try to use a hardcoded placeholder (which you should replace).
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+
+# --- Globals for Bot State (In-memory) ---
+# For a production bot, consider using a database for persistence.
+music_queue = deque()  # Holds dicts: {'link': str, 'added_by': str, 'title': str (optional)}
+current_track = None   # Stores the currently "playing" track dict
+bot_is_playing = False # Flag to indicate if the bot is actively "playing"
+
+# --- Logging Setup ---
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# --- Helper Functions ---
+def is_valid_url(url: str) -> bool:
+    """Rudimentary URL validation."""
+    # This regex is a common basic one. For strict validation, a library might be better.
+    regex = re.compile(
+        r'^(?:http|ftp)s?://'  # http:// or https://
+        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|'  # domain...
+        r'localhost|'  # localhost...
+        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'  # ...or ip
+        r'(?::\d+)?'  # optional port
+        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+    return re.match(regex, url) is not None
+
+async def play_next_track(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """
+    Pops the next track from the queue, sets it as current_track, and announces it.
+    """
+    global current_track, bot_is_playing
+    if music_queue:
+        current_track = music_queue.popleft()
+        bot_is_playing = True
+        track_link = current_track['link']
+        added_by = current_track['added_by']
+
+        message_text = f"🎧 Now Playing:\n{track_link}\n\nAdded by: @{added_by}"
+        
+        keyboard = [
+            [InlineKeyboardButton("⏭️ Skip", callback_data='skip_current_track')],
+            [InlineKeyboardButton("📜 View Queue", callback_data='view_current_queue')],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await context.bot.send_message(chat_id, text=message_text, reply_markup=reply_markup, disable_web_page_preview=False)
+    else:
+        current_track = None
+        bot_is_playing = False
+        await context.bot.send_message(chat_id, text="🎶 Queue is empty! Add some music with /add <link>.")
+
+# --- Command Handlers ---
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sends a welcome message when the /start command is issued."""
+    user = update.effective_user
+    await update.message.reply_html(
+        rf"Hi {user.mention_html()}! I'm your friendly Music Queue Bot 🎵.",
+    )
+    # Also send help information
+    await help_command(update, context, called_internally=True)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE, called_internally: bool = False) -> None:
+    """Sends a help message when the /help command is issued or called internally."""
+    help_text = (
+        "Here's how to use me:\n\n"
+        "➡️  `/add <music_link>`\n_Adds a music link (e.g., Spotify, YouTube) to the queue._\n\n"
+        "▶️  `/play`\n_Starts 'playing' music from the queue._\n\n"
+        "📜  `/queue`\n_Shows the current music queue._\n\n"
+        "⏭️  `/skip`\n_Skips the current track and 'plays' the next one._\n\n"
+        "🎶  `/nowplaying` or `/np`\n_Shows the track that's currently 'playing'._\n\n"
+        "⏹️  `/stop`\n_Clears the queue and stops 'playing'._\n\n"
+        "💁  `/help`\n_Shows this help message._"
+    )
+    # If called by start, send as a new message, otherwise reply to the /help command
+    if called_internally:
+        await context.bot.send_message(update.effective_chat.id, text=help_text, parse_mode='MarkdownV2')
+    else:
+        await update.message.reply_text(help_text, parse_mode='MarkdownV2')
+
+
+async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Adds a music link to the queue."""
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+
+    if not context.args:
+        await update.message.reply_text("Please provide a music link after /add.\nUsage: `/add <link>`", parse_mode='MarkdownV2')
+        return
+
+    link = context.args[0]
+    if not is_valid_url(link):
+        await update.message.reply_text("That doesn't look like a valid URL. Please provide a direct link to the music.")
+        return
+
+    # You could try to fetch the title of the webpage here if desired,
+    # but for simplicity, we're just using the link.
+    track_info = {'link': link, 'added_by': user.username or user.first_name, 'title': link}
+    music_queue.append(track_info)
+    
+    await update.message.reply_text(f"✅ Track added to queue!\n{link}\nQueue length: {len(music_queue)}")
+
+    # If nothing is playing and this is the first track added, offer to play it.
+    if not bot_is_playing and len(music_queue) == 1:
+        keyboard = [[InlineKeyboardButton("▶️ Play Now", callback_data='play_first_track')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("Start playing this track?", reply_markup=reply_markup)
+
+
+async def queue_command_display(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_to_edit=None) -> None:
+    """Helper function to display the queue."""
+    global current_track, music_queue
+    
+    if not music_queue and not current_track:
+        text_to_send = "The music queue is currently empty."
+    else:
+        message_parts = []
+        if current_track and bot_is_playing:
+            message_parts.append(f"🎧 *Now Playing:*\n[{current_track['title']}]({current_track['link']})\n_Added by: @{current_track['added_by']}_\n")
+
+        if music_queue:
+            message_parts.append("📜 *Upcoming Tracks:*")
+            for i, track in enumerate(list(music_queue)[:10]): # Show up to 10 tracks
+                message_parts.append(f"{i+1}\\. [{track['title']}]({track['link']})\n_Added by: @{track['added_by']}_")
+            if len(music_queue) > 10:
+                message_parts.append(f"\n\\.\\.\\.and {len(music_queue) - 10} more tracks in queue\\.")
+        elif not current_track: # Only upcoming tracks are empty, but nothing was playing
+             message_parts.append("The music queue is currently empty. Add songs with `/add <link>`")
+
+        text_to_send = "\n".join(message_parts)
+
+    if message_to_edit:
+        try:
+            await message_to_edit.edit_text(text_to_send, parse_mode='MarkdownV2', disable_web_page_preview=True)
+        except Exception as e: # If editing fails (e.g. message too old), send new one
+            logger.error(f"Failed to edit queue message: {e}")
+            await context.bot.send_message(chat_id, text_to_send, parse_mode='MarkdownV2', disable_web_page_preview=True)
+    else:
+        await context.bot.send_message(chat_id, text_to_send, parse_mode='MarkdownV2', disable_web_page_preview=True)
+
+
+async def queue_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Shows the current music queue."""
+    await queue_command_display(context, update.effective_chat.id)
+
+
+async def play_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Starts 'playing' music from the queue."""
+    global bot_is_playing
+    chat_id = update.effective_chat.id
+    if bot_is_playing and current_track:
+        await context.bot.send_message(chat_id, text=f"ℹ️ Already 'playing': [{current_track['title']}]({current_track['link']})", parse_mode='MarkdownV2', disable_web_page_preview=True)
+    elif music_queue:
+        await play_next_track(context, chat_id)
+    else:
+        await context.bot.send_message(chat_id, text="🎶 Queue is empty. Add songs with `/add <link>`.", parse_mode='MarkdownV2')
+
+
+async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Skips the current track and plays the next one."""
+    global current_track, bot_is_playing
+    chat_id = update.effective_chat.id
+    if current_track and bot_is_playing:
+        skipped_track_title = current_track['title']
+        await context.bot.send_message(chat_id, text=f"⏭️ Skipped: [{skipped_track_title}]({current_track['link']})", parse_mode='MarkdownV2', disable_web_page_preview=True)
+        await play_next_track(context, chat_id) # This will handle empty queue
+    else:
+        await context.bot.send_message(chat_id, text="ℹ️ Nothing is 'playing' to skip.")
+
+
+async def nowplaying_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Shows the track that's currently 'playing'."""
+    chat_id = update.effective_chat.id
+    if current_track and bot_is_playing:
+        await context.bot.send_message(
+            chat_id,
+            text=f"🎧 *Now Playing:*\n[{current_track['title']}]({current_track['link']})\n\n_Added by: @{current_track['added_by']}_",
+            parse_mode='MarkdownV2',
+            disable_web_page_preview=False
+        )
+    else:
+        await context.bot.send_message(chat_id, text="ℹ️ Nothing is currently 'playing'. Use `/play` to start a track from the queue.", parse_mode='MarkdownV2')
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clears the queue and stops 'playing'."""
+    global music_queue, current_track, bot_is_playing
+    chat_id = update.effective_chat.id
+    
+    music_queue.clear()
+    current_track = None
+    bot_is_playing = False
+    
+    await context.bot.send_message(chat_id, text="⏹️ Music queue cleared and 'playback' stopped.")
+
+# --- Callback Query Handler for Inline Buttons ---
+async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles button presses from inline keyboards."""
+    query = update.callback_query
+    await query.answer() # Acknowledge callback
+    chat_id = query.message.chat_id
+
+    if query.data == 'skip_current_track':
+        if current_track and bot_is_playing:
+            skipped_track_title = current_track['title']
+            await context.bot.send_message(chat_id, text=f"⏭️ Skipped via button: [{skipped_track_title}]({current_track['link']})", parse_mode='MarkdownV2', disable_web_page_preview=True)
+            await play_next_track(context, chat_id)
+            try: # Try to remove the "Controls" message after action
+                await query.message.delete()
+            except Exception as e:
+                logger.warning(f"Could not delete controls message: {e}")
+        else:
+            await query.edit_message_text(text="ℹ️ Nothing to skip or already skipped.")
+            
+    elif query.data == 'view_current_queue':
+        # Display the queue, potentially editing the message the button was on
+        await queue_command_display(context, chat_id, message_to_edit=query.message)
+        # No need to delete the original message if we are editing it for the queue display.
+        # If queue_command_display sends a new message, the old one with buttons remains.
+        # For simplicity, we'll let queue_command_display handle sending/editing.
+        # If you want to always remove the button message and send a new queue, delete here:
+        # try: await query.message.delete() except: pass
+        # await queue_command_display(context, chat_id) # then send new
+
+    elif query.data == 'play_first_track':
+        if music_queue and not bot_is_playing:
+            await play_next_track(context, chat_id)
+            try: # Remove the "Play Now?" prompt
+                await query.message.delete()
+            except Exception as e:
+                logger.warning(f"Could not delete 'Play Now' prompt: {e}")
+        elif bot_is_playing:
+            await query.edit_message_text(text="ℹ️ 'Playback' has already started.")
+        else:
+            await query.edit_message_text(text="ℹ️ Queue might be empty or an error occurred.")
+
+
+def main() -> None:
+    """Start the bot."""
+    if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or not TELEGRAM_BOT_TOKEN:
+        logger.error("CRITICAL: Telegram Bot Token is not configured.")
+        logger.error("Please set the TELEGRAM_BOT_TOKEN environment variable or replace 'YOUR_BOT_TOKEN_HERE' in the script.")
+        return
+
+    # Create the Application and pass it your bot's token.
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # --- Register Command Handlers ---
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("add", add_command))
+    application.add_handler(CommandHandler("queue", queue_command))
+    application.add_handler(CommandHandler("play", play_command))
+    application.add_handler(CommandHandler("skip", skip_command))
+    application.add_handler(CommandHandler("nowplaying", nowplaying_command))
+    application.add_handler(CommandHandler("np", nowplaying_command)) # Alias for nowplaying
+    application.add_handler(CommandHandler("stop", stop_command))
+
+    # --- Register Callback Query Handler for Inline Buttons ---
+    application.add_handler(CallbackQueryHandler(button_callback_handler))
+
+    # --- Start the Bot ---
+    logger.info("Music Queue Bot is starting...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Music Queue Bot has stopped.")
+
+if __name__ == "__main__":
+    main()
