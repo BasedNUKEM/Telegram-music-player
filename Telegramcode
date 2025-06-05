@@ -82,7 +82,7 @@ from telegram.ext import (
 )
 
 # --- Configuration ---
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+TELEGRAM_BOT_TOKEN = "8080900268:AAGOyGumBwZKlXUwmhrByc-Dx1QTQ5sztfE" # Directly set token
 QUEUE_FILE = "music_queues_by_chat.json" # Changed for multi-chat persistence
 
 # --- Globals for Bot State (Multi-Chat) ---
